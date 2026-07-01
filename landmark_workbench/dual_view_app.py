@@ -97,6 +97,7 @@ class SliceCanvas:
         line_angle_callback: Any,
         line_created_callback: Any,
         line_deleted_callback: Any,
+        activate_callback: Any,
     ):
         from qtpy.QtCore import Qt
         from qtpy.QtWidgets import QWidget
@@ -113,6 +114,7 @@ class SliceCanvas:
                 guide_angle_callback: Any,
                 guide_created_callback: Any,
                 guide_deleted_callback: Any,
+                activate_callback: Any,
             ):
                 super().__init__()
                 self.callback = callback
@@ -124,14 +126,24 @@ class SliceCanvas:
                 self.guide_angle_callback = guide_angle_callback
                 self.guide_created_callback = guide_created_callback
                 self.guide_deleted_callback = guide_deleted_callback
+                self.activate_callback = activate_callback
                 self.rgb: np.ndarray | None = None
                 self.points: list[DisplayPoint] = []
                 self.lines: list[DisplayLine] = []
                 self.orientation_labels: tuple[str, str] | None = None
                 self.preview_line: DisplayLine | None = None
                 self.image_rect = None
+                self.viewport_image_rect: tuple[float, float, float, float] | None = None
+                self.overview_rect = None
+                self.overview_view_rect = None
+                self.zoom_factor = 1.0
+                self.zoom_center: tuple[float, float] | None = None
+                self.max_zoom_factor = 12.0
                 self.drag_point: DisplayPoint | None = None
                 self.drag_offset: tuple[float, float] = (0.0, 0.0)
+                self.drag_overview = False
+                self.drag_pan = False
+                self.pan_previous_pos: tuple[float, float] | None = None
                 self.active_line: DisplayLine | None = None
                 self.active_line_part: str | None = None
                 self.line_anchor: tuple[float, float] | None = None
@@ -147,10 +159,15 @@ class SliceCanvas:
                 lines: list[DisplayLine],
                 orientation_labels: tuple[str, str] | None = None,
             ) -> None:
+                old_shape = self.rgb.shape[:2] if self.rgb is not None else None
                 self.rgb = np.ascontiguousarray(rgb, dtype=np.uint8)
                 self.points = points
                 self.lines = lines
                 self.orientation_labels = orientation_labels
+                if old_shape is not None and old_shape != self.rgb.shape[:2]:
+                    self.reset_zoom(update=False)
+                else:
+                    self._clamp_zoom_center()
                 self.update()
 
             def paintEvent(self, event: Any) -> None:
@@ -160,6 +177,9 @@ class SliceCanvas:
                 painter = QPainter(self)
                 painter.fillRect(self.rect(), QColor(15, 15, 15))
                 self.image_rect = None
+                self.viewport_image_rect = None
+                self.overview_rect = None
+                self.overview_view_rect = None
                 if self.rgb is None:
                     return
                 h, w, _ = self.rgb.shape
@@ -174,23 +194,31 @@ class SliceCanvas:
                 top = (self.height() - draw_h) / 2.0
                 rect = QRectF(left, top, draw_w, draw_h)
                 self.image_rect = rect
-                painter.drawImage(rect, qimage)
-                self._paint_orientation_labels(painter, left, top, draw_w)
+                viewport = self._zoom_viewport()
+                self.viewport_image_rect = viewport
+                row0, col0, row1, col1 = viewport
+                painter.drawImage(rect, qimage, QRectF(col0, row0, col1 - col0, row1 - row0))
+                painter.save()
+                painter.setClipRect(rect)
                 for line in self.lines:
-                    self._paint_line(painter, line, left, top, scale, selected=line is self.active_line)
+                    self._paint_line(painter, line, selected=line is self.active_line)
                 if self.preview_line is not None:
                     pen = QPen(QColor("#f7f871"), 2)
                     pen.setStyle(Qt.PenStyle.DashLine if hasattr(Qt, "PenStyle") else Qt.DashLine)
                     painter.setPen(pen)
                     r1, c1, r2, c2 = self._line_to_image(self.preview_line)
-                    painter.drawLine(int(left + c1 * scale), int(top + r1 * scale), int(left + c2 * scale), int(top + r2 * scale))
+                    x1, y1 = self._image_to_widget(r1, c1)
+                    x2, y2 = self._image_to_widget(r2, c2)
+                    painter.drawLine(int(x1), int(y1), int(x2), int(y2))
                 for point in self.points:
-                    x = left + point.col * scale
-                    y = top + point.row * scale
+                    x, y = self._image_to_widget(point.row, point.col)
                     painter.setPen(QPen(QColor(point.color), 2))
                     radius = 6 if point.editable else 4
                     painter.drawEllipse(int(x - radius), int(y - radius), radius * 2, radius * 2)
                     painter.drawText(int(x + 7), int(y - 7), point.label)
+                painter.restore()
+                self._paint_orientation_labels(painter, left, top, draw_w)
+                self._paint_zoom_overview(painter, qimage, rect, viewport)
 
             def _paint_orientation_labels(self, painter: Any, left: float, top: float, draw_w: float) -> None:
                 if not self.orientation_labels:
@@ -219,10 +247,163 @@ class SliceCanvas:
                     painter.setPen(QColor(255, 255, 255))
                     painter.drawText(rect, alignment, label)
 
+            def _paint_zoom_overview(self, painter: Any, qimage: Any, image_rect: Any, viewport: tuple[float, float, float, float]) -> None:
+                if self.rgb is None or self.zoom_factor <= 1.0:
+                    return
+                from qtpy.QtCore import QRectF
+                from qtpy.QtGui import QColor, QPen
+
+                h, w, _ = self.rgb.shape
+                max_size = min(float(image_rect.width()), float(image_rect.height())) * 0.28
+                overview_w = max(110.0, min(180.0, max_size))
+                overview_h = overview_w * float(h) / max(float(w), 1.0)
+                if overview_h > 180.0:
+                    overview_h = 180.0
+                    overview_w = overview_h * float(w) / max(float(h), 1.0)
+                margin = 10.0
+                top_offset = 48.0 if self.orientation_labels else margin
+                overview = QRectF(float(image_rect.left()) + margin, float(image_rect.top()) + top_offset, overview_w, overview_h)
+                self.overview_rect = overview
+                row0, col0, row1, col1 = viewport
+                view_rect = QRectF(
+                    overview.left() + col0 / max(float(w), 1.0) * overview.width(),
+                    overview.top() + row0 / max(float(h), 1.0) * overview.height(),
+                    (col1 - col0) / max(float(w), 1.0) * overview.width(),
+                    (row1 - row0) / max(float(h), 1.0) * overview.height(),
+                )
+                self.overview_view_rect = view_rect
+
+                painter.save()
+                painter.setOpacity(0.82)
+                painter.drawImage(overview, qimage)
+                painter.setOpacity(1.0)
+                painter.setPen(QPen(QColor(255, 255, 255, 220), 1))
+                painter.drawRect(overview)
+                painter.setPen(QPen(QColor("#f7f871"), 2))
+                painter.drawRect(view_rect)
+                painter.restore()
+
+            def _zoom_viewport(self) -> tuple[float, float, float, float]:
+                if self.rgb is None:
+                    return 0.0, 0.0, 1.0, 1.0
+                h, w, _ = self.rgb.shape
+                zoom = max(1.0, min(float(self.zoom_factor), self.max_zoom_factor))
+                self.zoom_factor = zoom
+                view_h = max(float(h) / zoom, 1.0)
+                view_w = max(float(w) / zoom, 1.0)
+                if self.zoom_center is None:
+                    center_row = (float(h) - 1.0) / 2.0
+                    center_col = (float(w) - 1.0) / 2.0
+                else:
+                    center_row, center_col = self.zoom_center
+                row0 = min(max(center_row - view_h / 2.0, 0.0), max(float(h) - view_h, 0.0))
+                col0 = min(max(center_col - view_w / 2.0, 0.0), max(float(w) - view_w, 0.0))
+                row1 = row0 + view_h
+                col1 = col0 + view_w
+                self.zoom_center = ((row0 + row1) / 2.0, (col0 + col1) / 2.0)
+                return row0, col0, row1, col1
+
+            def _clamp_zoom_center(self) -> None:
+                if self.rgb is None:
+                    self.zoom_center = None
+                    return
+                if self.zoom_factor <= 1.0:
+                    self.zoom_factor = 1.0
+                    self.zoom_center = None
+                    return
+                self._zoom_viewport()
+
+            def zoom_by(self, factor: float, center: tuple[float, float] | None = None) -> None:
+                if self.rgb is None:
+                    return
+                if center is None and self.zoom_center is None:
+                    h, w, _ = self.rgb.shape
+                    center = ((float(h) - 1.0) / 2.0, (float(w) - 1.0) / 2.0)
+                if center is not None:
+                    self.zoom_center = self._clamp_image_coords(center[0], center[1])
+                self.zoom_factor = max(1.0, min(float(self.zoom_factor) * float(factor), self.max_zoom_factor))
+                if self.zoom_factor <= 1.0001:
+                    self.reset_zoom(update=False)
+                else:
+                    self._clamp_zoom_center()
+                self.update()
+
+            def reset_zoom(self, update: bool = True) -> None:
+                self.zoom_factor = 1.0
+                self.zoom_center = None
+                self.drag_overview = False
+                self.drag_pan = False
+                self.pan_previous_pos = None
+                if update:
+                    self.update()
+
+            def zoom_status_text(self) -> str:
+                if self.zoom_factor <= 1.0:
+                    return ""
+                return f" | zoom {self.zoom_factor:.2f}x"
+
+            def _image_to_widget(self, row: float, col: float) -> tuple[float, float]:
+                if self.image_rect is None or self.viewport_image_rect is None:
+                    return float(col), float(row)
+                row0, col0, row1, col1 = self.viewport_image_rect
+                x = float(self.image_rect.left()) + (float(col) - col0) / max(col1 - col0, 1.0e-6) * float(self.image_rect.width())
+                y = float(self.image_rect.top()) + (float(row) - row0) / max(row1 - row0, 1.0e-6) * float(self.image_rect.height())
+                return x, y
+
+            def _current_image_scale(self) -> float:
+                if self.image_rect is None or self.viewport_image_rect is None:
+                    return 1.0
+                row0, col0, row1, col1 = self.viewport_image_rect
+                scale_x = float(self.image_rect.width()) / max(col1 - col0, 1.0e-6)
+                scale_y = float(self.image_rect.height()) / max(row1 - row0, 1.0e-6)
+                return min(scale_x, scale_y)
+
+            def _handle_overview_press(self, pos: Any) -> bool:
+                if self.zoom_factor <= 1.0 or self.overview_rect is None:
+                    return False
+                if not self.overview_rect.contains(pos):
+                    return False
+                self.drag_overview = True
+                self._set_zoom_center_from_overview(pos)
+                return True
+
+            def _set_zoom_center_from_overview(self, pos: Any) -> None:
+                if self.rgb is None or self.overview_rect is None:
+                    return
+                h, w, _ = self.rgb.shape
+                col = (float(pos.x()) - float(self.overview_rect.left())) / max(float(self.overview_rect.width()), 1.0e-6) * float(w)
+                row = (float(pos.y()) - float(self.overview_rect.top())) / max(float(self.overview_rect.height()), 1.0e-6) * float(h)
+                self.zoom_center = self._clamp_image_coords(row, col)
+                self._clamp_zoom_center()
+                self.update()
+
+            def _handle_pan_move(self, pos: Any) -> None:
+                if self.pan_previous_pos is None or self.image_rect is None or self.viewport_image_rect is None:
+                    return
+                previous_x, previous_y = self.pan_previous_pos
+                dx = float(pos.x()) - previous_x
+                dy = float(pos.y()) - previous_y
+                self.pan_previous_pos = (float(pos.x()), float(pos.y()))
+                row0, col0, row1, col1 = self.viewport_image_rect
+                center_row = (row0 + row1) / 2.0 - dy / max(float(self.image_rect.height()), 1.0e-6) * (row1 - row0)
+                center_col = (col0 + col1) / 2.0 - dx / max(float(self.image_rect.width()), 1.0e-6) * (col1 - col0)
+                self.zoom_center = (center_row, center_col)
+                self._clamp_zoom_center()
+                self.update()
+
             def mousePressEvent(self, event: Any) -> None:
+                self.activate_callback()
                 left_button = Qt.MouseButton.LeftButton if hasattr(Qt, "MouseButton") else Qt.LeftButton
                 right_button = Qt.MouseButton.RightButton if hasattr(Qt, "MouseButton") else Qt.RightButton
-                if event.button() not in (left_button, right_button):
+                middle_button = Qt.MouseButton.MiddleButton if hasattr(Qt, "MouseButton") else Qt.MiddleButton
+                if event.button() not in (left_button, right_button, middle_button):
+                    return
+                pos = self._event_pos(event)
+                if event.button() == left_button and self._handle_overview_press(pos):
+                    return
+                if event.button() == middle_button and self.zoom_factor > 1.0 and self.image_rect is not None and self.image_rect.contains(pos):
+                    self.drag_pan = True
+                    self.pan_previous_pos = (float(pos.x()), float(pos.y()))
                     return
                 coords = self._event_image_coords(event)
                 if coords is None:
@@ -244,6 +425,12 @@ class SliceCanvas:
                 self.callback(row, col)
 
             def mouseMoveEvent(self, event: Any) -> None:
+                if self.drag_overview:
+                    self._set_zoom_center_from_overview(self._event_pos(event))
+                    return
+                if self.drag_pan:
+                    self._handle_pan_move(self._event_pos(event))
+                    return
                 if self.active_line is not None:
                     coords = self._event_image_coords(event, clamp=True)
                     if coords is None:
@@ -263,6 +450,13 @@ class SliceCanvas:
                 self.point_drag_callback(self.drag_point, row, col, False)
 
             def mouseReleaseEvent(self, event: Any) -> None:
+                if self.drag_overview:
+                    self.drag_overview = False
+                    return
+                if self.drag_pan:
+                    self.drag_pan = False
+                    self.pan_previous_pos = None
+                    return
                 if self.active_line is not None:
                     coords = self._event_image_coords(event, clamp=True)
                     if coords is not None:
@@ -283,7 +477,15 @@ class SliceCanvas:
                 self.point_drag_callback(point, row, col, True)
 
             def wheelEvent(self, event: Any) -> None:
+                self.activate_callback()
                 delta = event.angleDelta().y()
+                ctrl = Qt.KeyboardModifier.ControlModifier if hasattr(Qt, "KeyboardModifier") else Qt.ControlModifier
+                if event.modifiers() & ctrl:
+                    coords = self._event_image_coords(event, clamp=True)
+                    if coords is not None:
+                        self.zoom_by(1.25 if delta > 0 else 0.8, center=coords)
+                        event.accept()
+                    return
                 if delta > 0:
                     self.wheel_callback(-1)
                 elif delta < 0:
@@ -301,15 +503,22 @@ class SliceCanvas:
                     cursor = Qt.CursorShape.ArrowCursor if hasattr(Qt, "CursorShape") else Qt.ArrowCursor
                 self.setCursor(cursor)
 
+            def enterEvent(self, event: Any) -> None:
+                self.activate_callback()
+                super().enterEvent(event)
+
+            def _event_pos(self, event: Any) -> Any:
+                return event.position() if hasattr(event, "position") else event.pos()
+
             def _event_image_coords(self, event: Any, clamp: bool = False) -> tuple[float, float] | None:
-                if self.rgb is None or self.image_rect is None:
+                if self.rgb is None or self.image_rect is None or self.viewport_image_rect is None:
                     return None
-                pos = event.position() if hasattr(event, "position") else event.pos()
+                pos = self._event_pos(event)
                 if not clamp and not self.image_rect.contains(pos):
                     return None
-                h, w, _ = self.rgb.shape
-                col = (float(pos.x()) - float(self.image_rect.left())) / float(self.image_rect.width()) * w
-                row = (float(pos.y()) - float(self.image_rect.top())) / float(self.image_rect.height()) * h
+                row0, col0, row1, col1 = self.viewport_image_rect
+                col = col0 + (float(pos.x()) - float(self.image_rect.left())) / float(self.image_rect.width()) * (col1 - col0)
+                row = row0 + (float(pos.y()) - float(self.image_rect.top())) / float(self.image_rect.height()) * (row1 - row0)
                 if clamp:
                     row, col = self._clamp_image_coords(row, col)
                 return row, col
@@ -323,8 +532,7 @@ class SliceCanvas:
             def _nearest_editable_point(self, row: float, col: float) -> DisplayPoint | None:
                 if self.rgb is None or self.image_rect is None:
                     return None
-                h, w, _ = self.rgb.shape
-                scale = min(float(self.image_rect.width()) / max(w, 1), float(self.image_rect.height()) / max(h, 1))
+                scale = self._current_image_scale()
                 hit_radius = 12.0 / max(scale, 1.0e-6)
                 candidates = [
                     (float(np.hypot(point.row - row, point.col - col)), point)
@@ -399,16 +607,19 @@ class SliceCanvas:
                 self.line_drag_previous = None
                 self.update()
 
-            def _paint_line(self, painter: Any, line: DisplayLine, left: float, top: float, scale: float, selected: bool) -> None:
+            def _paint_line(self, painter: Any, line: DisplayLine, selected: bool) -> None:
                 from qtpy.QtGui import QColor, QPen
 
                 r1, c1, r2, c2 = self._line_to_image(line)
                 painter.setPen(QPen(QColor("#f7f871" if selected else line.color), 2))
-                painter.drawLine(int(left + c1 * scale), int(top + r1 * scale), int(left + c2 * scale), int(top + r2 * scale))
+                x1, y1 = self._image_to_widget(r1, c1)
+                x2, y2 = self._image_to_widget(r2, c2)
+                painter.drawLine(int(x1), int(y1), int(x2), int(y2))
                 painter.setPen(QPen(QColor("#ffffff"), 1))
                 for row, col in [(r1, c1), (r2, c2)]:
-                    x = int(left + col * scale)
-                    y = int(top + row * scale)
+                    x, y = self._image_to_widget(row, col)
+                    x = int(x)
+                    y = int(y)
                     painter.drawRect(x - 3, y - 3, 6, 6)
 
             def _make_line(self, row1: float, col1: float, row2: float, col2: float) -> DisplayLine:
@@ -441,8 +652,7 @@ class SliceCanvas:
             def _nearest_line(self, row: float, col: float) -> tuple[DisplayLine | None, str | None]:
                 if self.rgb is None or self.image_rect is None:
                     return None, None
-                h, w, _ = self.rgb.shape
-                scale = min(float(self.image_rect.width()) / max(w, 1), float(self.image_rect.height()) / max(h, 1))
+                scale = self._current_image_scale()
                 hit_radius = 10.0 / max(scale, 1.0e-6)
                 best: tuple[float, DisplayLine, str] | None = None
                 for line in self.lines:
@@ -496,6 +706,7 @@ class SliceCanvas:
             line_angle_callback,
             line_created_callback,
             line_deleted_callback,
+            activate_callback,
         )
         self.widget.setParent(parent)
 
@@ -540,6 +751,7 @@ class DualImagePanel:
             self.line_angle,
             self._on_line_created,
             self._on_line_deleted,
+            self._on_activate,
         ).widget
         self.slider = QSlider(Qt.Orientation.Horizontal if hasattr(Qt, "Orientation") else Qt.Horizontal)
         self.slice_label = QLabel("slice 0/0")
@@ -611,12 +823,15 @@ class DualImagePanel:
         self.app.render_panel(self)
 
     def _on_click(self, row: float, col: float) -> None:
+        self._on_activate()
         self.app.save_click(self, row, col)
 
     def _on_drag_point(self, point: DisplayPoint, row: float, col: float, final: bool) -> None:
+        self._on_activate()
         self.app.move_display_point(self, point, row, col, final)
 
     def _on_delete_point(self, point: DisplayPoint) -> None:
+        self._on_activate()
         self.app.delete_display_point(self, point)
 
     def _on_line_created(self, line: DisplayLine) -> None:
@@ -627,6 +842,17 @@ class DualImagePanel:
     def _on_line_deleted(self, line: DisplayLine) -> None:
         if line in self.guide_lines:
             self.guide_lines.remove(line)
+        self.app.render_panel(self)
+
+    def _on_activate(self) -> None:
+        self.app.set_active_zoom_panel(self)
+
+    def zoom_by(self, factor: float) -> None:
+        self.canvas.zoom_by(factor)
+        self.app.render_panel(self)
+
+    def reset_zoom(self) -> None:
+        self.canvas.reset_zoom()
         self.app.render_panel(self)
 
 
@@ -672,6 +898,7 @@ class DualViewWorkbench:
         self.status_label = None
         self.left_panel: DualImagePanel | None = None
         self.right_panel: DualImagePanel | None = None
+        self.active_zoom_panel: DualImagePanel | None = None
         self.three_d_panel: Globe3DPanel | None = None
         self.shift_shortcut_filter = None
         self.live_overlay_timer = None
@@ -791,6 +1018,7 @@ class DualViewWorkbench:
         splitter = QSplitter(Qt.Orientation.Horizontal if hasattr(Qt, "Orientation") else Qt.Horizontal)
         self.left_panel = DualImagePanel(self, "Left view", SOURCE_CT, VIEW_AXIAL)
         self.right_panel = DualImagePanel(self, "Right view", SOURCE_MRI, VIEW_CORONAL)
+        self.active_zoom_panel = self.right_panel
         self.three_d_panel = Globe3DPanel(self)
         splitter.addWidget(self.left_panel.widget)
         splitter.addWidget(self.right_panel.widget)
@@ -825,6 +1053,12 @@ class DualViewWorkbench:
         QShortcut(QKeySequence("x"), self.window).activated.connect(lambda: self.set_3d_mode(MODE_SCALE_X))
         QShortcut(QKeySequence("y"), self.window).activated.connect(lambda: self.set_3d_mode(MODE_SCALE_Y))
         QShortcut(QKeySequence("z"), self.window).activated.connect(lambda: self.set_3d_mode(MODE_SCALE_Z))
+        for sequence in ["Ctrl++", "Ctrl+=", "Meta++", "Meta+="]:
+            QShortcut(QKeySequence(sequence), self.window).activated.connect(lambda factor=1.25: self.zoom_active_panel(factor))
+        for sequence in ["Ctrl+-", "Meta+-"]:
+            QShortcut(QKeySequence(sequence), self.window).activated.connect(lambda factor=0.8: self.zoom_active_panel(factor))
+        for sequence in ["Ctrl+0", "Meta+0"]:
+            QShortcut(QKeySequence(sequence), self.window).activated.connect(self.reset_active_panel_zoom)
         self.shift_shortcut_filter = _ShiftShortcutFilter(
             lambda: self.update_globe_registration_preview(write_outputs=False, switch_to_preview=True, echo=True)
         )
@@ -1030,7 +1264,9 @@ class DualViewWorkbench:
             rgb = self.gray_rgb(image)
         points = self.display_points_for_panel(panel)
         panel.canvas.set_scene(rgb, points, panel.guide_lines, self.lr_corner_labels_for_panel(panel))
-        panel.slice_label.setText(f"slice {slice_index} / {panel.slider.maximum()} | {panel.source()} {panel.view()}")
+        panel.slice_label.setText(
+            f"slice {slice_index} / {panel.slider.maximum()} | {panel.source()} {panel.view()}{panel.canvas.zoom_status_text()}"
+        )
 
     def array_for_panel(self, panel: DualImagePanel) -> np.ndarray | None:
         source = panel.source()
@@ -1848,6 +2084,21 @@ class DualViewWorkbench:
         if self.three_d_panel is not None:
             self.three_d_panel.set_mode(mode)
             self.set_status(f"3D mode: {mode}\n{self.status_text()}")
+
+    def set_active_zoom_panel(self, panel: DualImagePanel) -> None:
+        self.active_zoom_panel = panel
+
+    def zoom_active_panel(self, factor: float) -> None:
+        panel = self.active_zoom_panel or self.right_panel or self.left_panel
+        if panel is None:
+            return
+        panel.zoom_by(factor)
+
+    def reset_active_panel_zoom(self) -> None:
+        panel = self.active_zoom_panel or self.right_panel or self.left_panel
+        if panel is None:
+            return
+        panel.reset_zoom()
 
     def set_globe_side(self, side: str, echo: bool = True) -> None:
         value = str(side).upper()

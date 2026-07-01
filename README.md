@@ -85,6 +85,8 @@ Default MRI series is `T2 COR dixon_(IN W)_in`. The left panel starts as CT axia
 
 Axial and coronal views show patient-side `L`/`R` labels in the top corners. Globe surface clicks in axial/coronal views automatically save the side from the DICOM LPS coordinate, so the manual eye selector is only a fallback for sagittal or unusual cases.
 
+Use `Ctrl+=` / `Ctrl++` to zoom in, `Ctrl+-` to zoom out, and `Ctrl+0` to reset zoom on the last hovered/clicked view. On macOS, the same shortcuts work with `Command` instead of `Ctrl`. While zoomed, a small overview appears in the top-left of the view; drag the yellow ROI box to pan the zoomed region. `Ctrl` + mouse wheel also zooms, and the normal mouse wheel still changes slices.
+
 ## Outputs
 
 Annotations and transform outputs are written under:
