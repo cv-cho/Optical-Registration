@@ -2704,7 +2704,7 @@ class DualViewWorkbench:
         if self.progress_label is None:
             return
         completed, total = self.registration_progress_counts()
-        self.progress_label.setText(f"Done {completed}/{total}")
+        self.progress_label.setText(f"Index {self.queue_position_text()} | Done {completed}/{total}")
 
     @staticmethod
     def _read_work_queue(path: Path | None) -> list[dict[str, str]]:

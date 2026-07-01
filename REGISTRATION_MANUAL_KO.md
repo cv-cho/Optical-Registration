@@ -35,7 +35,7 @@ bash scripts/run_workbench.sh
 ## 2. 기본 화면 규칙
 
 - 왼쪽 view는 기본적으로 CT axial, 오른쪽 view는 MRI coronal입니다.
-- 상단의 `Done 완료/전체` 표시는 현재 work queue에서 저장된 정합 결과가 있는 환자 수입니다.
+- 상단의 `Index 현재/전체`는 현재 보고 있는 환자의 work queue 순번이고, `Done 완료/전체`는 저장된 정합 결과가 있는 환자 수입니다.
 - 화면 상단 모서리의 `L` / `R` 표시가 실제 환자 기준 좌우입니다. 화면 왼쪽이 항상 환자 왼쪽이라는 뜻이 아닙니다.
 - Axial/coronal에서 안구 외곽점을 찍으면 L/R은 자동 저장됩니다.
 - `Ctrl+=` 또는 `Ctrl++`: zoom in
