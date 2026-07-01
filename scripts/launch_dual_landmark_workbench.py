@@ -14,25 +14,39 @@ sys.path.insert(0, str(WORKDIR))
 
 def configure_qt_runtime() -> None:
     os.environ["QT_API"] = "pyqt6"
-    candidates = [
-        WORKDIR / ".venv" / "Lib" / "site-packages" / "PyQt6" / "Qt6",
-        WORKDIR.parent / ".venv-rtx5090" / "Lib" / "site-packages" / "PyQt6" / "Qt6",
-    ]
-    for qt_root in candidates:
-        platforms = qt_root / "plugins" / "platforms"
-        if not platforms.exists():
-            continue
-        if not os.environ.get("QT_PLUGIN_PATH"):
-            os.environ["QT_PLUGIN_PATH"] = str(qt_root / "plugins")
-        os.environ["QT_QPA_PLATFORM_PLUGIN_PATH"] = str(platforms)
-        qt_bin = qt_root / "bin"
+    plugin_root = pyqt6_plugin_root()
+    if plugin_root is not None:
+        platforms = plugin_root / "platforms"
+        if platforms.exists():
+            if not os.environ.get("QT_PLUGIN_PATH"):
+                os.environ["QT_PLUGIN_PATH"] = str(plugin_root)
+            os.environ["QT_QPA_PLATFORM_PLUGIN_PATH"] = str(platforms)
+        qt_bin = plugin_root.parent / "bin"
         if qt_bin.exists():
             os.environ["PATH"] = str(qt_bin) + os.pathsep + os.environ.get("PATH", "")
             if hasattr(os, "add_dll_directory"):
                 os.add_dll_directory(str(qt_bin))
-        break
     if sys.platform == "darwin":
         os.environ.setdefault("QT_MAC_WANTS_LAYER", "1")
+
+
+def pyqt6_plugin_root() -> Path | None:
+    try:
+        from PyQt6.QtCore import QLibraryInfo
+
+        path = Path(QLibraryInfo.path(QLibraryInfo.LibraryPath.PluginsPath))
+        if path.exists():
+            return path
+    except Exception:
+        pass
+    candidates = [
+        WORKDIR / ".venv" / "Lib" / "site-packages" / "PyQt6" / "Qt6" / "plugins",
+        WORKDIR.parent / ".venv-rtx5090" / "Lib" / "site-packages" / "PyQt6" / "Qt6" / "plugins",
+    ]
+    for path in candidates:
+        if path.exists():
+            return path
+    return None
 
 
 configure_qt_runtime()
