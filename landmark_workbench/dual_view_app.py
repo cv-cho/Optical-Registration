@@ -1071,6 +1071,7 @@ class DualViewWorkbench:
             QShortcut(QKeySequence(sequence), self.window).activated.connect(lambda factor=0.8: self.zoom_active_panel(factor))
         for sequence in ["Ctrl+0", "Meta+0"]:
             QShortcut(QKeySequence(sequence), self.window).activated.connect(self.reset_active_panel_zoom)
+        QShortcut(QKeySequence("Esc"), self.window).activated.connect(self.cancel_center_override_click)
         self.shift_shortcut_filter = _ShiftShortcutFilter(
             lambda: self.update_globe_registration_preview(write_outputs=False, switch_to_preview=True, echo=True)
         )
@@ -1349,6 +1350,17 @@ class DualViewWorkbench:
         self.set_status(
             f"Click a native {modality} view to force {self.center_override_label(modality, side)}.\n"
             f"Existing surface points stay unchanged.",
+            echo=True,
+        )
+
+    def cancel_center_override_click(self) -> None:
+        if self.center_override_click_target is None:
+            return
+        modality, side = self.center_override_click_target
+        self.center_override_click_target = None
+        self.set_status(
+            f"Cancelled forced {self.center_override_label(modality, side)} click mode; normal globe surface point mode is active.\n"
+            f"{self.status_text()}",
             echo=True,
         )
 
