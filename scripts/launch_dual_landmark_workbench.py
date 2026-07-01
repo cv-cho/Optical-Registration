@@ -8,12 +8,34 @@ import sys
 from pathlib import Path
 
 
-os.environ.setdefault("QT_API", "pyqt6")
-if sys.platform == "darwin":
-    os.environ.setdefault("QT_MAC_WANTS_LAYER", "1")
-
 WORKDIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(WORKDIR))
+
+
+def configure_qt_runtime() -> None:
+    os.environ["QT_API"] = "pyqt6"
+    candidates = [
+        WORKDIR / ".venv" / "Lib" / "site-packages" / "PyQt6" / "Qt6",
+        WORKDIR.parent / ".venv-rtx5090" / "Lib" / "site-packages" / "PyQt6" / "Qt6",
+    ]
+    for qt_root in candidates:
+        platforms = qt_root / "plugins" / "platforms"
+        if not platforms.exists():
+            continue
+        if not os.environ.get("QT_PLUGIN_PATH"):
+            os.environ["QT_PLUGIN_PATH"] = str(qt_root / "plugins")
+        os.environ["QT_QPA_PLATFORM_PLUGIN_PATH"] = str(platforms)
+        qt_bin = qt_root / "bin"
+        if qt_bin.exists():
+            os.environ["PATH"] = str(qt_bin) + os.pathsep + os.environ.get("PATH", "")
+            if hasattr(os, "add_dll_directory"):
+                os.add_dll_directory(str(qt_bin))
+        break
+    if sys.platform == "darwin":
+        os.environ.setdefault("QT_MAC_WANTS_LAYER", "1")
+
+
+configure_qt_runtime()
 
 from landmark_workbench.dual_view_app import run  # noqa: E402
 
