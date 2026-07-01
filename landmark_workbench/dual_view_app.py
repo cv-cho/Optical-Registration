@@ -896,6 +896,7 @@ class DualViewWorkbench:
         self.scale_x_spin = None
         self.scale_y_spin = None
         self.scale_z_spin = None
+        self.progress_label = None
         self.status_label = None
         self.left_panel: DualImagePanel | None = None
         self.right_panel: DualImagePanel | None = None
@@ -968,6 +969,7 @@ class DualViewWorkbench:
         prev_button = QPushButton("Previous")
         next_button = QPushButton("Next")
         delete_patient_button = QPushButton("Delete current data")
+        self.progress_label = QLabel()
         self.mri_combo = QComboBox()
         self.mri_combo.addItems(list(MRI_CANDIDATE_SERIES))
         self.mri_combo.setCurrentText(self.requested_mri_series_description)
@@ -993,6 +995,7 @@ class DualViewWorkbench:
             load_button,
             prev_button,
             next_button,
+            self.progress_label,
             delete_patient_button,
             QLabel("MRI"),
             self.mri_combo,
@@ -1137,6 +1140,7 @@ class DualViewWorkbench:
         self.load_manual_parameters_for_current_series()
         self.refresh_all_panels()
         self.refresh_3d_panel()
+        self.update_progress_label()
         self.set_status(self.status_text())
 
     def reset_panel_sources_for_loaded_patient(self) -> None:
@@ -2016,7 +2020,10 @@ class DualViewWorkbench:
             self.loading_manual_parameters = False
 
     def globe_registration_output_dir(self) -> Path:
-        return self.patient_output_dir(self.patient_id) / "globe_manual_registration" / self.safe_path_component(self.mri_series_description)
+        return self.globe_registration_output_dir_for_patient(self.patient_id, self.mri_series_description)
+
+    def globe_registration_output_dir_for_patient(self, patient_id: str, series_description: str) -> Path:
+        return self.patient_output_dir(patient_id) / "globe_manual_registration" / self.safe_path_component(series_description)
 
     def patient_output_dir(self, patient_id: str | None = None) -> Path:
         return self.db_path.parent / str(patient_id if patient_id is not None else self.patient_id)
@@ -2353,6 +2360,7 @@ class DualViewWorkbench:
         }
         return (
             f"patient={self.patient_id} queue={self.queue_position_text()} | "
+            f"{self.registration_progress_text()} | "
             f"MRI={self.mri_series_description} | "
             f"eye side=auto axial/coronal, manual {self.globe_side()} fallback | "
             f"pitch={self.pitch_degrees():.2f}, "
@@ -2374,6 +2382,7 @@ class DualViewWorkbench:
         return " | ".join(parts)
 
     def set_status(self, text: str, echo: bool = True) -> None:
+        self.update_progress_label()
         if self.status_label is not None:
             self.status_label.setText(text)
         if echo:
@@ -2649,6 +2658,53 @@ class DualViewWorkbench:
         if self.queue_index is None:
             return f"not in queue / {len(self.queue_rows)}"
         return f"{self.queue_index + 1}/{len(self.queue_rows)}"
+
+    def registration_progress_patient_ids(self) -> list[str]:
+        patients: list[str] = []
+        seen: set[str] = set()
+        if self.queue_rows:
+            for row in self.queue_rows:
+                patient_id = str(row.get("patient_id", "")).strip()
+                if not patient_id or patient_id in seen:
+                    continue
+                row_series = str(row.get("mri_series_description", "")).strip()
+                if row_series and row_series != self.mri_series_description:
+                    continue
+                patients.append(patient_id)
+                seen.add(patient_id)
+            return patients
+        for patient_id in sorted(
+            {
+                str(row.get("patient_id", "")).strip()
+                for row in self.manifest_rows
+                if str(row.get("modality", "")).upper() == "MR"
+                and str(row.get("series_description", "")) == self.mri_series_description
+                and str(row.get("patient_id", "")).strip()
+            }
+        ):
+            if patient_id not in seen:
+                patients.append(patient_id)
+                seen.add(patient_id)
+        return patients
+
+    def registration_progress_counts(self) -> tuple[int, int]:
+        patients = self.registration_progress_patient_ids()
+        completed = 0
+        for patient_id in patients:
+            qc_path = self.globe_registration_output_dir_for_patient(patient_id, self.mri_series_description) / "globe_manual_registration_qc.json"
+            if qc_path.exists():
+                completed += 1
+        return completed, len(patients)
+
+    def registration_progress_text(self) -> str:
+        completed, total = self.registration_progress_counts()
+        return f"done={completed}/{total}"
+
+    def update_progress_label(self) -> None:
+        if self.progress_label is None:
+            return
+        completed, total = self.registration_progress_counts()
+        self.progress_label.setText(f"Done {completed}/{total}")
 
     @staticmethod
     def _read_work_queue(path: Path | None) -> list[dict[str, str]]:
