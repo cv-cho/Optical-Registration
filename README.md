@@ -2,6 +2,8 @@
 
 This repository contains only the registration program. Patient image data and generated annotations must not be committed.
 
+Korean registration workflow manual: [REGISTRATION_MANUAL_KO.md](REGISTRATION_MANUAL_KO.md)
+
 ## Expected Layout
 
 After cloning, unpack the collaborator data archive into the repository root so these paths exist:
