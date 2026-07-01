@@ -15,7 +15,7 @@ from .geometry import (
     napari_zyx_from_physical_lps,
     point_inside_array_shape_zyx,
 )
-from .globe import fit_globe_spheres
+from .globe import SphereFit, fit_globe_spheres
 from .globe_registration import (
     estimate_globe_manual_initializer,
     resample_mri_to_ct,
@@ -23,7 +23,7 @@ from .globe_registration import (
 )
 from .napari_app import MRI_CANDIDATE_SERIES, MRI_CANDIDATE_SHORT_NAMES
 from .schema import LANDMARK_LABELS
-from .store import AnnotationStore, GlobeSurfacePointRecord, LandmarkRecord
+from .store import AnnotationStore, GlobeCenterOverrideRecord, GlobeSurfacePointRecord, LandmarkRecord
 from .three_d_view import Globe3DPanel, MODE_PITCH, MODE_SCALE_X, MODE_SCALE_Y, MODE_SCALE_Z, MODE_VIEW
 from .transform import (
     estimate_rigid_initializer,
@@ -889,6 +889,7 @@ class DualViewWorkbench:
         self.mri_combo = None
         self.label_combo = None
         self.globe_side_combo = None
+        self.center_override_combo = None
         self.visibility_combo = None
         self.quality_combo = None
         self.pitch_spin = None
@@ -908,6 +909,7 @@ class DualViewWorkbench:
         self.live_overlay_interval_ms = 150
         self.loading_manual_parameters = False
         self.autosave_disabled_for_patient_id: str | None = None
+        self.center_override_click_target: tuple[str, str] | None = None
 
         self.ct_volume = None
         self.mri_volume = None
@@ -976,6 +978,10 @@ class DualViewWorkbench:
         right_eye_button = QPushButton("Manual R (W)")
         globe_compute_button = QPushButton("Compute globe MRI-on-CT")
         save_globe_button = QPushButton("Save globe transform")
+        self.center_override_combo = QComboBox()
+        self.center_override_combo.addItems(["CT LC", "CT RC", "MRI LC", "MRI RC"])
+        set_center_button = QPushButton("Set center by click")
+        clear_center_button = QPushButton("Clear forced center")
         self.pitch_spin = self._make_spin(-45.0, 45.0, 0.0, 1.0)
         self.scale_x_spin = self._make_spin(0.5, 1.5, 1.0, 0.01)
         self.scale_y_spin = self._make_spin(0.5, 1.5, 1.0, 0.01)
@@ -1003,6 +1009,10 @@ class DualViewWorkbench:
         for widget in [
             globe_compute_button,
             save_globe_button,
+            QLabel("Center"),
+            self.center_override_combo,
+            set_center_button,
+            clear_center_button,
             QLabel("Pitch"),
             self.pitch_spin,
             QLabel("Scale X(LR)"),
@@ -1041,6 +1051,8 @@ class DualViewWorkbench:
         right_eye_button.clicked.connect(lambda: self.set_globe_side("R"))
         globe_compute_button.clicked.connect(lambda: self.update_globe_registration_preview(write_outputs=False, switch_to_preview=True, echo=True))
         save_globe_button.clicked.connect(lambda: self.update_globe_registration_preview(write_outputs=True, switch_to_preview=True, echo=True))
+        set_center_button.clicked.connect(self.start_center_override_click)
+        clear_center_button.clicked.connect(self.clear_selected_center_override)
         for spin in [self.pitch_spin, self.scale_x_spin, self.scale_y_spin, self.scale_z_spin]:
             spin.valueChanged.connect(lambda _value: self.on_manual_parameter_changed())
 
@@ -1106,6 +1118,7 @@ class DualViewWorkbench:
         self.ct_series_description = ct_volume.selection.series_description
         self.mri_series_description = mri_volume.selection.series_description
         self.requested_mri_series_description = self.mri_series_description
+        self.center_override_click_target = None
         self.overlay_result = None
         self.overlay_ct_soft_lps = None
         self.overlay_ct_bone_lps = None
@@ -1151,6 +1164,7 @@ class DualViewWorkbench:
                 f"- annotation_events: {counts.get('annotation_events', 0)}\n"
                 f"- globe_surface_points: {counts.get('globe_surface_points', 0)}\n"
                 f"- globe_manual_parameters: {counts.get('globe_manual_parameters', 0)}\n"
+                f"- globe_center_overrides: {counts.get('globe_center_overrides', 0)}\n"
                 f"Output folder: {'yes' if output_exists else 'no'}\n\n"
                 "This only deletes the saved annotation/registration outputs, not the original DICOM data."
             )
@@ -1293,6 +1307,10 @@ class DualViewWorkbench:
         return None
 
     def save_click(self, panel: DualImagePanel, row: float, col: float) -> None:
+        if self.center_override_click_target is not None:
+            modality, side = self.center_override_click_target
+            self.save_globe_center_override_click(panel, row, col, modality, side)
+            return
         if self.click_target() == CLICK_TARGET_GLOBE:
             self.save_globe_surface_click(panel, row, col)
             return
@@ -1315,6 +1333,98 @@ class DualViewWorkbench:
         if self.globe_side_combo is None:
             return "L"
         return str(self.globe_side_combo.currentText()).upper()
+
+    def selected_center_override_target(self) -> tuple[str, str]:
+        text = str(self.center_override_combo.currentText() if self.center_override_combo is not None else "CT LC").upper()
+        modality = "MRI" if text.startswith("MRI") else "CT"
+        side = "R" if "RC" in text else "L"
+        return modality, side
+
+    def center_override_label(self, modality: str, side: str) -> str:
+        return f"{modality} {side}C"
+
+    def start_center_override_click(self) -> None:
+        self.center_override_click_target = self.selected_center_override_target()
+        modality, side = self.center_override_click_target
+        self.set_status(
+            f"Click a native {modality} view to force {self.center_override_label(modality, side)}.\n"
+            f"Existing surface points stay unchanged.",
+            echo=True,
+        )
+
+    def clear_selected_center_override(self) -> None:
+        modality, side = self.selected_center_override_target()
+        series_uid = self.series_uid_for_modality(modality)
+        if not series_uid:
+            self.set_status(f"Cannot clear {self.center_override_label(modality, side)}: no active {modality} series.")
+            return
+        deleted = self.store.delete_globe_center_override(self.patient_id, modality, series_uid, side)
+        self.center_override_click_target = None
+        self.autosave_disabled_for_patient_id = None
+        self.schedule_live_globe_registration_update(final=True)
+        self.refresh_all_panels()
+        self.refresh_3d_panel()
+        action = "Cleared" if deleted else "No forced center to clear for"
+        self.set_status(f"{action} {self.center_override_label(modality, side)}.\n{self.status_text()}")
+
+    def save_globe_center_override_click(
+        self,
+        panel: DualImagePanel,
+        row: float,
+        col: float,
+        modality: str,
+        side: str,
+    ) -> None:
+        record = self.globe_center_override_record_from_display(panel, row, col, modality, side)
+        if record is None:
+            return
+        self.center_override_click_target = None
+        self.autosave_disabled_for_patient_id = None
+        self.store.upsert_globe_center_override(record)
+        self.schedule_live_globe_registration_update(final=True)
+        self.refresh_all_panels()
+        self.refresh_3d_panel()
+        lps_text = ", ".join(f"{value:.2f}" for value in record.physical_lps_mm)
+        self.set_status(
+            f"Forced {self.center_override_label(record.modality, record.side)} at LPS=({lps_text}).\n"
+            f"{self.status_text()}"
+        )
+
+    def globe_center_override_record_from_display(
+        self,
+        panel: DualImagePanel,
+        row: float,
+        col: float,
+        modality: str,
+        side: str,
+    ) -> GlobeCenterOverrideRecord | None:
+        modality = str(modality).upper()
+        side = str(side).upper()
+        if panel.source() != (SOURCE_CT if modality == "CT" else SOURCE_MRI):
+            self.set_status(f"Use a native {modality} view to set {self.center_override_label(modality, side)}.")
+            return None
+        volume = self.volume_for_modality(modality)
+        panel_image = self.panel_image_for_modality(panel, modality)
+        if volume is None or panel_image is None:
+            return None
+        index_xyz = self.display_to_index_xyz(panel, panel.slice_index(), row, col)
+        try:
+            physical_lps = tuple(float(v) for v in panel_image.TransformContinuousIndexToPhysicalPoint(index_xyz))
+            native_index_xyz = tuple(float(v) for v in volume.image.TransformPhysicalPointToContinuousIndex(physical_lps))
+        except Exception as exc:
+            self.set_status(f"Could not map forced center to DICOM physical coordinate: {exc}")
+            return None
+        native_index_xyz = self.clamp_tiny_index_drift(native_index_xyz, volume.image.GetSize())
+        physical_lps = tuple(float(v) for v in volume.image.TransformContinuousIndexToPhysicalPoint(native_index_xyz))
+        return GlobeCenterOverrideRecord(
+            patient_id=self.patient_id,
+            study_uid=volume.selection.study_uid,
+            series_uid=volume.selection.series_uid,
+            modality=modality,
+            side=side,
+            physical_lps_mm=[float(v) for v in physical_lps],
+            annotator_id=self.annotator_id,
+        )
 
     def save_globe_surface_click(self, panel: DualImagePanel, row: float, col: float) -> None:
         auto_side = self.uses_auto_globe_side(panel)
@@ -1440,11 +1550,50 @@ class DualViewWorkbench:
             self.refresh_3d_panel()
             self.set_status(f"Moved {record.modality} {record.side} globe surface point #{point.record_id}\n{self.status_text()}")
 
+    def move_globe_center_point(self, panel: DualImagePanel, point: DisplayPoint, row: float, col: float, final: bool) -> None:
+        if point.side is None:
+            return
+        if not final:
+            return
+        record = self.globe_center_override_record_from_display(panel, row, col, point.modality, point.side)
+        if record is None:
+            return
+        self.autosave_disabled_for_patient_id = None
+        self.store.upsert_globe_center_override(record)
+        self.schedule_live_globe_registration_update(final=True)
+        self.refresh_all_panels()
+        self.refresh_3d_panel()
+        lps_text = ", ".join(f"{value:.2f}" for value in record.physical_lps_mm)
+        self.set_status(
+            f"Moved forced {self.center_override_label(record.modality, record.side)} to LPS=({lps_text}).\n"
+            f"{self.status_text()}"
+        )
+
+    def delete_globe_center_override(self, point: DisplayPoint) -> None:
+        if point.side is None:
+            return
+        series_uid = self.series_uid_for_modality(point.modality)
+        if not series_uid:
+            return
+        if point.record_id is None:
+            self.set_status(f"{self.center_override_label(point.modality, point.side)} is fitted, not forced; nothing to clear.")
+            return
+        deleted = self.store.delete_globe_center_override(self.patient_id, point.modality, series_uid, point.side)
+        self.autosave_disabled_for_patient_id = None
+        self.schedule_live_globe_registration_update(final=True)
+        self.refresh_all_panels()
+        self.refresh_3d_panel()
+        action = "Cleared forced" if deleted else "No forced center found for"
+        self.set_status(f"{action} {self.center_override_label(point.modality, point.side)}.\n{self.status_text()}")
+
     def move_display_point(self, panel: DualImagePanel, point: DisplayPoint, row: float, col: float, final: bool) -> None:
         if not point.editable:
             return
         if point.kind == "globe":
             self.move_globe_surface_point(panel, point, row, col, final)
+            return
+        if point.kind == "globe_center":
+            self.move_globe_center_point(panel, point, row, col, final)
             return
         self.set_current_label(point.label, echo=False)
         event_type = "drag_release" if final else "drag"
@@ -1471,6 +1620,9 @@ class DualViewWorkbench:
             self.refresh_all_panels()
             self.refresh_3d_panel()
             self.set_status(f"Deleted {point.modality} {point.side} globe surface point #{point.record_id}\n{self.status_text()}")
+            return
+        if point.kind == "globe_center":
+            self.delete_globe_center_override(point)
             return
         series_uid = self.series_uid_for_modality(point.modality)
         if series_uid is None:
@@ -1876,7 +2028,8 @@ class DualViewWorkbench:
                 fit = fits.get((modality, side))
                 count = counts.get((modality, side), 0)
                 if fit:
-                    parts.append(f"{modality}-{side}: n={fit.n_points}, r={fit.radius_mm:.1f}, rms={fit.rms_residual_mm:.2f}")
+                    forced = ", forced center" if getattr(fit, "status", "") == "manual_override" else ""
+                    parts.append(f"{modality}-{side}: n={fit.n_points}, r={fit.radius_mm:.1f}, rms={fit.rms_residual_mm:.2f}{forced}")
                 else:
                     parts.append(f"{modality}-{side}: n={count}, no sphere")
         return " | ".join(parts)
@@ -1975,27 +2128,40 @@ class DualViewWorkbench:
                 points.append(point)
 
         fits = self.current_globe_sphere_fits()
-        center_items: list[tuple[tuple[float, float, float], str, str, str]] = []
+        overrides = {
+            (str(record["modality"]).upper(), str(record["side"]).upper()): record
+            for record in self.fetch_current_globe_center_overrides()
+        }
+        center_items: list[tuple[tuple[float, float, float], str, str, str, str, bool, int | None]] = []
         if source == SOURCE_CT:
             for side in ("L", "R"):
                 fit = fits.get(("CT", side))
                 if fit:
-                    center_items.append((tuple(fit.center_lps), "#eaff00", f"CT {side}C", "CT"))
+                    override = overrides.get(("CT", side))
+                    label = self.center_override_label("CT", side) + ("*" if override else "")
+                    center_items.append((tuple(fit.center_lps), "#ff9f1c" if override else "#eaff00", label, "CT", side, True, int(override["id"]) if override else None))
         elif source in (SOURCE_MRI, SOURCE_OVERLAY):
             for side in ("L", "R"):
                 fit = fits.get(("MRI", side))
                 if fit:
-                    center_items.append((tuple(fit.center_lps), "#00f0ff", f"MRI {side}C", "MRI"))
+                    override = overrides.get(("MRI", side))
+                    label = self.center_override_label("MRI", side) + ("*" if override else "")
+                    editable = source == SOURCE_MRI
+                    center_items.append((tuple(fit.center_lps), "#ff9f1c" if override else "#00f0ff", label, "MRI", side, editable, int(override["id"]) if override else None))
         elif source == SOURCE_MRI_ON_CT:
             for side in ("L", "R"):
                 fit = fits.get(("CT", side))
                 if fit:
-                    center_items.append((tuple(fit.center_lps), "#eaff00", f"CT {side}C", "CT"))
+                    override = overrides.get(("CT", side))
+                    label = self.center_override_label("CT", side) + ("*" if override else "")
+                    center_items.append((tuple(fit.center_lps), "#ff9f1c" if override else "#eaff00", label, "CT", side, False, int(override["id"]) if override else None))
                 moving_fit = fits.get(("MRI", side))
                 if moving_fit and self.globe_registration_result is not None:
                     moved = self.globe_registration_result.transform_moving_to_fixed.TransformPoint(tuple(moving_fit.center_lps))
-                    center_items.append((tuple(float(v) for v in moved), "#00f0ff", f"MRI {side}C", "MRI"))
-        for point_lps, color, label, modality in center_items:
+                    override = overrides.get(("MRI", side))
+                    label = self.center_override_label("MRI", side) + ("*" if override else "")
+                    center_items.append((tuple(float(v) for v in moved), "#ff9f1c" if override else "#00f0ff", label, "MRI", side, False, int(override["id"]) if override else None))
+        for point_lps, color, label, modality, side, editable, record_id in center_items:
             point = self.display_point_from_lps(
                 panel=panel,
                 target_image=target_image,
@@ -2003,8 +2169,10 @@ class DualViewWorkbench:
                 color=color,
                 label=label,
                 modality=modality,
-                editable=False,
+                editable=editable,
                 kind="globe_center",
+                record_id=record_id,
+                side=side,
             )
             if point is not None:
                 points.append(point)
@@ -2063,11 +2231,54 @@ class DualViewWorkbench:
             return []
         return self.store.fetch_globe_surface_points(self.patient_id, modality, series_uid=uid)
 
+    def fetch_current_globe_center_overrides(self, modality: str | None = None) -> list[dict[str, Any]]:
+        if modality is not None:
+            uid = self.series_uid_for_modality(modality)
+            if uid is None:
+                return []
+            return self.store.fetch_globe_center_overrides(self.patient_id, modality, series_uid=uid)
+        records: list[dict[str, Any]] = []
+        for item in ("CT", "MRI"):
+            records.extend(self.fetch_current_globe_center_overrides(item))
+        return records
+
     def current_globe_sphere_fits(self) -> dict[tuple[str, str], Any]:
         points: list[dict[str, Any]] = []
         points.extend(self.fetch_current_globe_points("CT"))
         points.extend(self.fetch_current_globe_points("MRI"))
-        return fit_globe_spheres(points)
+        fits = fit_globe_spheres(points)
+        return self.apply_globe_center_overrides(fits)
+
+    def apply_globe_center_overrides(self, fits: dict[tuple[str, str], SphereFit]) -> dict[tuple[str, str], SphereFit]:
+        for override in self.fetch_current_globe_center_overrides():
+            key = (str(override["modality"]).upper(), str(override["side"]).upper())
+            previous = fits.get(key)
+            if previous is not None:
+                radius = float(previous.radius_mm)
+                n_points = int(previous.n_points)
+                rms = float(previous.rms_residual_mm)
+                maximum = float(previous.max_residual_mm)
+            else:
+                radius = self.default_globe_radius_mm(fits, key[0])
+                n_points = 0
+                rms = 0.0
+                maximum = 0.0
+            fits[key] = SphereFit(
+                center_lps=[float(v) for v in override["physical_lps_mm"]],
+                radius_mm=radius,
+                n_points=n_points,
+                rms_residual_mm=rms,
+                max_residual_mm=maximum,
+                status="manual_override",
+            )
+        return fits
+
+    @staticmethod
+    def default_globe_radius_mm(fits: dict[tuple[str, str], SphereFit], modality: str) -> float:
+        radii = [float(fit.radius_mm) for (fit_modality, _side), fit in fits.items() if fit_modality == modality and fit.radius_mm > 0.0]
+        if not radii:
+            radii = [float(fit.radius_mm) for fit in fits.values() if fit.radius_mm > 0.0]
+        return float(np.median(radii)) if radii else 12.0
 
     def series_uid_for_modality(self, modality: str) -> str | None:
         if modality == "CT" and self.ct_volume is not None:

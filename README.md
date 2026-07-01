@@ -87,6 +87,8 @@ Axial and coronal views show patient-side `L`/`R` labels in the top corners. Glo
 
 Use `Ctrl+=` / `Ctrl++` to zoom in, `Ctrl+-` to zoom out, and `Ctrl+0` to reset zoom on the last hovered/clicked view. On macOS, the same shortcuts work with `Command` instead of `Ctrl`. While zoomed, a small overview appears in the top-left of the view; drag the yellow ROI box to pan the zoomed region. `Ctrl` + mouse wheel also zooms, and the normal mouse wheel still changes slices.
 
+If a fitted globe center is wrong, select `CT LC`, `CT RC`, `MRI LC`, or `MRI RC` in the `Center` control and press `Set center by click`, then click the correct center in the matching native CT/MRI view. Existing center markers can also be dragged to create/update a forced center. Forced centers are marked with `*`; right-click a forced center or use `Clear forced center` to remove the override.
+
 ## Outputs
 
 Annotations and transform outputs are written under:

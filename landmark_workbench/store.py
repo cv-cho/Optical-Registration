@@ -112,6 +112,33 @@ class GlobeSurfacePointRecord:
         return asdict(self)
 
 
+@dataclass
+class GlobeCenterOverrideRecord:
+    patient_id: str
+    study_uid: str
+    series_uid: str
+    modality: str
+    side: str
+    physical_lps_mm: list[float]
+    source: str = "manual_globe_center_override"
+    annotator_id: str = "default"
+    updated_at: str = ""
+    software_versions: dict[str, Any] | None = None
+
+    def normalized(self) -> "GlobeCenterOverrideRecord":
+        self.modality = validate_modality(self.modality)
+        self.side = self.side.upper()
+        if self.side not in ("L", "R"):
+            raise ValueError(f"Unknown globe side: {self.side}")
+        self.updated_at = utc_now()
+        if self.software_versions is None:
+            self.software_versions = current_software_versions()
+        return self
+
+    def to_jsonable(self) -> dict[str, Any]:
+        return asdict(self)
+
+
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS landmarks (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -183,6 +210,21 @@ CREATE TABLE IF NOT EXISTS globe_manual_parameters (
     updated_at TEXT NOT NULL,
     software_versions TEXT NOT NULL,
     UNIQUE(patient_id, ct_series_uid, mri_series_uid)
+);
+
+CREATE TABLE IF NOT EXISTS globe_center_overrides (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    patient_id TEXT NOT NULL,
+    study_uid TEXT NOT NULL,
+    series_uid TEXT NOT NULL,
+    modality TEXT NOT NULL,
+    side TEXT NOT NULL,
+    physical_lps_mm TEXT NOT NULL,
+    source TEXT NOT NULL,
+    annotator_id TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    software_versions TEXT NOT NULL,
+    UNIQUE(patient_id, modality, series_uid, side)
 );
 """
 
@@ -350,6 +392,102 @@ class AnnotationStore:
         rows = self.conn.execute(sql, params).fetchall()
         return [self._deserialize_row(dict(row), keep_id=True) for row in rows]
 
+    def upsert_globe_center_override(self, record: GlobeCenterOverrideRecord) -> None:
+        record = record.normalized()
+        payload = record.to_jsonable()
+        row = self._serialize_json_row(payload)
+        columns = list(row)
+        placeholders = ", ".join("?" for _ in columns)
+        update_columns = [col for col in columns if col not in {"patient_id", "modality", "series_uid", "side"}]
+        updates = ", ".join(f"{col}=excluded.{col}" for col in update_columns)
+        sql = (
+            f"INSERT INTO globe_center_overrides ({', '.join(columns)}) VALUES ({placeholders}) "
+            f"ON CONFLICT(patient_id, modality, series_uid, side) DO UPDATE SET {updates}"
+        )
+        self.conn.execute(sql, [row[col] for col in columns])
+        self.conn.execute(
+            """
+            INSERT INTO annotation_events
+                (patient_id, modality, landmark_label, event_type, payload, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                record.patient_id,
+                record.modality,
+                f"{record.side}_GLOBE_CENTER_OVERRIDE",
+                "globe_center_override_upsert",
+                json.dumps(payload, ensure_ascii=True),
+                utc_now(),
+            ),
+        )
+        self.conn.commit()
+
+    def fetch_globe_center_overrides(
+        self,
+        patient_id: str,
+        modality: str | None = None,
+        series_uid: str | None = None,
+        side: str | None = None,
+    ) -> list[dict[str, Any]]:
+        clauses = ["patient_id=?"]
+        params = [str(patient_id)]
+        if modality:
+            clauses.append("modality=?")
+            params.append(validate_modality(modality))
+        if series_uid:
+            clauses.append("series_uid=?")
+            params.append(str(series_uid))
+        if side:
+            side_value = side.upper()
+            if side_value not in ("L", "R"):
+                raise ValueError(f"Unknown globe side: {side}")
+            clauses.append("side=?")
+            params.append(side_value)
+        sql = (
+            "SELECT * FROM globe_center_overrides WHERE "
+            + " AND ".join(clauses)
+            + " ORDER BY modality, series_uid, side"
+        )
+        rows = self.conn.execute(sql, params).fetchall()
+        return [self._deserialize_row(dict(row), keep_id=True) for row in rows]
+
+    def delete_globe_center_override(
+        self,
+        patient_id: str,
+        modality: str,
+        series_uid: str,
+        side: str,
+    ) -> bool:
+        modality_value = validate_modality(modality)
+        side_value = side.upper()
+        if side_value not in ("L", "R"):
+            raise ValueError(f"Unknown globe side: {side}")
+        cursor = self.conn.execute(
+            """
+            DELETE FROM globe_center_overrides
+            WHERE patient_id=? AND modality=? AND series_uid=? AND side=?
+            """,
+            (str(patient_id), modality_value, str(series_uid), side_value),
+        )
+        deleted = int(cursor.rowcount or 0) > 0
+        self.conn.execute(
+            """
+            INSERT INTO annotation_events
+                (patient_id, modality, landmark_label, event_type, payload, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                str(patient_id),
+                modality_value,
+                f"{side_value}_GLOBE_CENTER_OVERRIDE",
+                "globe_center_override_delete",
+                json.dumps({"series_uid": str(series_uid), "deleted": deleted}, ensure_ascii=True),
+                utc_now(),
+            ),
+        )
+        self.conn.commit()
+        return deleted
+
     def delete_globe_surface_point(self, point_id: int) -> None:
         row = self.conn.execute("SELECT * FROM globe_surface_points WHERE id=?", (int(point_id),)).fetchone()
         if row is None:
@@ -463,7 +601,13 @@ class AnnotationStore:
     def count_patient_data(self, patient_id: str) -> dict[str, int]:
         patient_id = str(patient_id)
         counts: dict[str, int] = {}
-        for table in ["landmarks", "annotation_events", "globe_surface_points", "globe_manual_parameters"]:
+        for table in [
+            "landmarks",
+            "annotation_events",
+            "globe_surface_points",
+            "globe_manual_parameters",
+            "globe_center_overrides",
+        ]:
             if table not in self._table_names():
                 counts[table] = 0
                 continue
@@ -476,7 +620,13 @@ class AnnotationStore:
         patient_id = str(patient_id)
         counts = self.count_patient_data(patient_id)
         with self.conn:
-            for table in ["landmarks", "annotation_events", "globe_surface_points", "globe_manual_parameters"]:
+            for table in [
+                "landmarks",
+                "annotation_events",
+                "globe_surface_points",
+                "globe_manual_parameters",
+                "globe_center_overrides",
+            ]:
                 if table in self._table_names():
                     self.conn.execute(f"DELETE FROM {table} WHERE patient_id=?", (patient_id,))
         return counts
