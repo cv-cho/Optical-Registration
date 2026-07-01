@@ -83,6 +83,8 @@ bash scripts/run_workbench.sh --patient-id 102059
 
 Default MRI series is `T2 COR dixon_(IN W)_in`. The left panel starts as CT axial and the right panel starts as MRI coronal.
 
+Axial and coronal views show patient-side `L`/`R` labels in the top corners. Globe surface clicks in axial/coronal views automatically save the side from the DICOM LPS coordinate, so the manual eye selector is only a fallback for sagittal or unusual cases.
+
 ## Outputs
 
 Annotations and transform outputs are written under:

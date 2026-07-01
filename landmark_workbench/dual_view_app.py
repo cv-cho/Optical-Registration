@@ -127,6 +127,7 @@ class SliceCanvas:
                 self.rgb: np.ndarray | None = None
                 self.points: list[DisplayPoint] = []
                 self.lines: list[DisplayLine] = []
+                self.orientation_labels: tuple[str, str] | None = None
                 self.preview_line: DisplayLine | None = None
                 self.image_rect = None
                 self.drag_point: DisplayPoint | None = None
@@ -139,10 +140,17 @@ class SliceCanvas:
                 self.setMouseTracking(True)
                 self.update_cursor()
 
-            def set_scene(self, rgb: np.ndarray, points: list[DisplayPoint], lines: list[DisplayLine]) -> None:
+            def set_scene(
+                self,
+                rgb: np.ndarray,
+                points: list[DisplayPoint],
+                lines: list[DisplayLine],
+                orientation_labels: tuple[str, str] | None = None,
+            ) -> None:
                 self.rgb = np.ascontiguousarray(rgb, dtype=np.uint8)
                 self.points = points
                 self.lines = lines
+                self.orientation_labels = orientation_labels
                 self.update()
 
             def paintEvent(self, event: Any) -> None:
@@ -167,6 +175,7 @@ class SliceCanvas:
                 rect = QRectF(left, top, draw_w, draw_h)
                 self.image_rect = rect
                 painter.drawImage(rect, qimage)
+                self._paint_orientation_labels(painter, left, top, draw_w)
                 for line in self.lines:
                     self._paint_line(painter, line, left, top, scale, selected=line is self.active_line)
                 if self.preview_line is not None:
@@ -182,6 +191,33 @@ class SliceCanvas:
                     radius = 6 if point.editable else 4
                     painter.drawEllipse(int(x - radius), int(y - radius), radius * 2, radius * 2)
                     painter.drawText(int(x + 7), int(y - 7), point.label)
+
+            def _paint_orientation_labels(self, painter: Any, left: float, top: float, draw_w: float) -> None:
+                if not self.orientation_labels:
+                    return
+                from qtpy.QtCore import QRectF, Qt
+                from qtpy.QtGui import QColor, QFont
+
+                left_label, right_label = self.orientation_labels
+                font = QFont()
+                font.setBold(True)
+                font.setPointSize(18)
+                painter.setFont(font)
+                align_left = Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop if hasattr(Qt, "AlignmentFlag") else Qt.AlignLeft | Qt.AlignTop
+                align_right = Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop if hasattr(Qt, "AlignmentFlag") else Qt.AlignRight | Qt.AlignTop
+                label_width = 80.0
+                label_height = 36.0
+                margin = 10.0
+                items = [
+                    (left_label, QRectF(left + margin, top + margin, label_width, label_height), align_left),
+                    (right_label, QRectF(left + draw_w - label_width - margin, top + margin, label_width, label_height), align_right),
+                ]
+                for label, rect, alignment in items:
+                    painter.setPen(QColor(0, 0, 0, 220))
+                    for dx, dy in [(-1.0, 0.0), (1.0, 0.0), (0.0, -1.0), (0.0, 1.0)]:
+                        painter.drawText(rect.translated(dx, dy), alignment, label)
+                    painter.setPen(QColor(255, 255, 255))
+                    painter.drawText(rect, alignment, label)
 
             def mousePressEvent(self, event: Any) -> None:
                 left_button = Qt.MouseButton.LeftButton if hasattr(Qt, "MouseButton") else Qt.LeftButton
@@ -728,7 +764,7 @@ class DualViewWorkbench:
             QLabel("MRI"),
             self.mri_combo,
             load_mri_button,
-            QLabel("Patient eye"),
+            QLabel("Manual eye"),
             self.globe_side_combo,
             left_eye_button,
             right_eye_button,
@@ -993,7 +1029,7 @@ class DualViewWorkbench:
         else:
             rgb = self.gray_rgb(image)
         points = self.display_points_for_panel(panel)
-        panel.canvas.set_scene(rgb, points, panel.guide_lines)
+        panel.canvas.set_scene(rgb, points, panel.guide_lines, self.lr_corner_labels_for_panel(panel))
         panel.slice_label.setText(f"slice {slice_index} / {panel.slider.maximum()} | {panel.source()} {panel.view()}")
 
     def array_for_panel(self, panel: DualImagePanel) -> np.ndarray | None:
@@ -1045,15 +1081,62 @@ class DualViewWorkbench:
         return str(self.globe_side_combo.currentText()).upper()
 
     def save_globe_surface_click(self, panel: DualImagePanel, row: float, col: float) -> None:
-        record = self.globe_surface_record_from_display(panel, row, col, self.globe_side())
+        auto_side = self.uses_auto_globe_side(panel)
+        side = self.globe_side_for_display_point(panel, row, col)
+        record = self.globe_surface_record_from_display(panel, row, col, side)
         if record is None:
             return
+        if auto_side:
+            self.set_globe_side(record.side, echo=False)
         self.autosave_disabled_for_patient_id = None
         point_id = self.store.add_globe_surface_point(record)
         self.schedule_live_globe_registration_update(final=True)
         self.refresh_all_panels()
         self.refresh_3d_panel()
-        self.set_status(f"Saved {record.modality} {record.side} globe surface point #{point_id}\n{self.status_text()}")
+        side_mode = "auto" if auto_side else "manual"
+        self.set_status(f"Saved {record.modality} {record.side} globe surface point #{point_id} ({side_mode} side)\n{self.status_text()}")
+
+    def uses_auto_globe_side(self, panel: DualImagePanel) -> bool:
+        return panel.source() in (SOURCE_CT, SOURCE_MRI) and panel.view() in (VIEW_AXIAL, VIEW_CORONAL)
+
+    def globe_side_for_display_point(self, panel: DualImagePanel, row: float, col: float) -> str:
+        if not self.uses_auto_globe_side(panel):
+            return self.globe_side()
+        panel_image = self.image_for_panel(panel)
+        if panel_image is None:
+            return self.globe_side()
+        try:
+            index_xyz = self.display_to_index_xyz(panel, panel.slice_index(), row, col)
+            physical_lps = panel_image.TransformContinuousIndexToPhysicalPoint(index_xyz)
+            center_x = self.image_center_lps_x(panel_image)
+        except Exception:
+            return self.globe_side()
+        return "L" if float(physical_lps[0]) >= center_x else "R"
+
+    def lr_corner_labels_for_panel(self, panel: DualImagePanel) -> tuple[str, str] | None:
+        if panel.view() not in (VIEW_AXIAL, VIEW_CORONAL):
+            return None
+        panel_image = self.image_for_panel(panel)
+        raw_height = self.raw_slice_height(panel)
+        raw_width = self.raw_slice_width(panel)
+        if panel_image is None or raw_height <= 0 or raw_width <= 1:
+            return None
+        display_height = self.display_slice_height(panel, raw_height)
+        display_width = self.display_slice_width(panel, raw_width)
+        if display_width <= 1:
+            return None
+        sample_row = float(max(display_height - 1, 0)) / 2.0
+        slice_index = panel.slice_index()
+        try:
+            left_index = self.display_to_index_xyz(panel, slice_index, sample_row, 0.0)
+            right_index = self.display_to_index_xyz(panel, slice_index, sample_row, float(display_width - 1))
+            left_x = float(panel_image.TransformContinuousIndexToPhysicalPoint(left_index)[0])
+            right_x = float(panel_image.TransformContinuousIndexToPhysicalPoint(right_index)[0])
+        except Exception:
+            return None
+        if abs(left_x - right_x) < 1e-6:
+            return None
+        return ("L", "R") if left_x > right_x else ("R", "L")
 
     def globe_surface_record_from_display(
         self,
@@ -1774,7 +1857,7 @@ class DualViewWorkbench:
         if self.globe_side_combo is not None and self.globe_side_combo.currentText() != value:
             self.globe_side_combo.setCurrentText(value)
         if echo:
-            self.set_status(f"Active globe surface side: {value}\n{self.status_text()}", echo=True)
+            self.set_status(f"Manual globe surface side: {value} (used for sagittal/fallback)\n{self.status_text()}", echo=True)
 
     def set_current_label(self, label: str, echo: bool = True) -> None:
         self.current_label = label
@@ -1797,7 +1880,7 @@ class DualViewWorkbench:
         return (
             f"patient={self.patient_id} queue={self.queue_position_text()} | "
             f"MRI={self.mri_series_description} | "
-            f"active eye={self.globe_side()} | "
+            f"eye side=auto axial/coronal, manual {self.globe_side()} fallback | "
             f"pitch={self.pitch_degrees():.2f}, "
             f"scale=({self.manual_scale_xyz()[0]:.3f}, {self.manual_scale_xyz()[1]:.3f}, {self.manual_scale_xyz()[2]:.3f}) | "
             f"globe surface CT L/R={counts.get(('CT', 'L'), 0)}/{counts.get(('CT', 'R'), 0)}, "
@@ -2054,6 +2137,12 @@ class DualViewWorkbench:
         import SimpleITK as sitk
 
         return sitk.DICOMOrient(image, "LPS")
+
+    @staticmethod
+    def image_center_lps_x(image: Any) -> float:
+        size = image.GetSize()
+        center_index = tuple((float(size[axis]) - 1.0) / 2.0 for axis in range(3))
+        return float(image.TransformContinuousIndexToPhysicalPoint(center_index)[0])
 
     @staticmethod
     def sitk_array(image: Any) -> np.ndarray:
