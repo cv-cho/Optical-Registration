@@ -109,3 +109,45 @@ outputs/landmarks/<patient_id>/
 ```
 
 Do not commit `data/`, `reports/*.csv`, or `outputs/landmarks/*`.
+
+## Export Completed Training Pairs
+
+After registration is finished, export the completed half dataset from the clone root. Patient `102697` is excluded by default because of the known data problem.
+
+Windows dry run:
+
+```powershell
+.\.venv\Scripts\python.exe .\scripts\export_t2_cor_registered_training_pairs.py --dry-run
+```
+
+Windows export and archive:
+
+```powershell
+.\.venv\Scripts\python.exe .\scripts\export_t2_cor_registered_training_pairs.py --overwrite --make-archive
+```
+
+macOS dry run:
+
+```bash
+python scripts/export_t2_cor_registered_training_pairs.py --dry-run
+```
+
+macOS export and archive:
+
+```bash
+python scripts/export_t2_cor_registered_training_pairs.py --overwrite --make-archive
+```
+
+The output folder is:
+
+```text
+outputs/training_pairs/T2_COR_dixon_IN_W_in_registered_brightness_trimmed/
+```
+
+With `--make-archive`, the transferable archive is:
+
+```text
+outputs/training_pairs/T2_COR_dixon_IN_W_in_registered_brightness_trimmed.tar.gz
+```
+
+The export uses the existing preprocessing pattern: CT is resampled onto the native MRI grid, the pair is cropped to common CT-valid/MRI-foreground support, CT is scaled from HU `[-1000, 2000]` to `[-1, 1]`, MRI is scaled by nonzero foreground `0.5-99.5` percentiles, and contiguous low-brightness edge slices are trimmed using the patient-wise median/MAD rule.
